@@ -1038,7 +1038,7 @@ libmesos_la_SOURCES =							\
   $(V1_MESOS_PROTO)							\
   $(V1_SCHEDULER_PROTO)
 
-libmesos_la_LDFLAGS = -release $(PACKAGE_VERSION)
+libmesos_la_LDFLAGS = -release $(PACKAGE_VERSION) -Wl,--version-script=$(top_srcdir)/version.map
 
 # Since we just include the convenience library (and no sources), we
 # need to tell libtool to build this as a C++ library.

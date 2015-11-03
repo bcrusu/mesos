@@ -1,0 +1,7 @@
+mesos {
+  local:
+    http_method_str;
+    http_should_keep_alive;
+    http_parser_execute;
+    http_parser_init;
+};
