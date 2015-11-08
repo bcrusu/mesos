@@ -174,7 +174,13 @@ public:
 
             NetworkInfo* networkInfo =
               status.mutable_container_status()->add_network_infos();
+
+            // TODO(CD): Deprecated -- Remove after 0.27.0.
             networkInfo->set_ip_address(container.ipAddress.get());
+
+            NetworkInfo::IPAddress* ipAddress =
+              networkInfo->add_ip_addresses();
+            ipAddress->set_ip_address(container.ipAddress.get());
           }
           driver->sendStatusUpdate(status);
         }
@@ -362,7 +368,7 @@ private:
           return;
       }
 
-      JSON::Object json = JSON::Protobuf(healthCheck);
+      JSON::Object json = JSON::protobuf(healthCheck);
 
       // Launch the subprocess using 'exec' style so that quotes can
       // be properly handled.

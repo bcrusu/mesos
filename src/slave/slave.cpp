@@ -643,13 +643,21 @@ void Slave::shutdown(const UPID& from, const string& message)
     LOG(INFO) << "Slave asked to shut down by " << from
               << (message.empty() ? "" : " because '" + message + "'");
   } else if (info.has_id()) {
-    LOG(INFO) << message << "; unregistering and shutting down";
+    if (message.empty()) {
+      LOG(INFO) << "Unregistering and shutting down";
+    } else {
+      LOG(INFO) << message << "; unregistering and shutting down";
+    }
 
     UnregisterSlaveMessage message_;
     message_.mutable_slave_id()->MergeFrom(info.id());
     send(master.get(), message_);
   } else {
-    LOG(INFO) << message << "; shutting down";
+    if (message.empty()) {
+      LOG(INFO) << "Shutting down";
+    } else {
+      LOG(INFO) << message << "; shutting down";
+    }
   }
 
   state = TERMINATING;
@@ -1351,7 +1359,7 @@ void Slave::runTask(
     }
   }
 
-  const ExecutorInfo executorInfo = getExecutorInfo(frameworkId, task);
+  const ExecutorInfo executorInfo = getExecutorInfo(frameworkInfo, task);
   const ExecutorID& executorId = executorInfo.executor_id();
 
   if (HookManager::hooksAvailable()) {
@@ -1410,7 +1418,7 @@ void Slave::_runTask(
     return;
   }
 
-  const ExecutorInfo executorInfo = getExecutorInfo(frameworkId, task);
+  const ExecutorInfo executorInfo = getExecutorInfo(frameworkInfo, task);
   const ExecutorID& executorId = executorInfo.executor_id();
 
   if (framework->pending.contains(executorId) &&
@@ -2832,7 +2840,13 @@ void Slave::statusUpdate(StatusUpdate update, const UPID& pid)
     update.mutable_status()->mutable_container_status();
   if (containerStatus->network_infos().size() == 0) {
     NetworkInfo* networkInfo = containerStatus->add_network_infos();
+
+    // TODO(CD): Deprecated -- Remove after 0.27.0.
     networkInfo->set_ip_address(stringify(self().address.ip));
+
+    NetworkInfo::IPAddress* ipAddress =
+      networkInfo->add_ip_addresses();
+    ipAddress->set_ip_address(stringify(self().address.ip));
   }
 
   TaskStatus status = update.status();
@@ -3022,6 +3036,15 @@ void Slave::forward(StatusUpdate update)
     return;
   }
 
+  // Ensure that task status uuid is set even if this update was sent by the
+  // status update manager after recovering a pre 0.23.x slave/executor driver's
+  // updates. This allows us to simplify the master code (in >= 0.27.0) to
+  // assume the uuid is always set for retryable updates.
+  CHECK(update.has_uuid())
+    << "Expecting updates without 'uuid' to have been rejected";
+
+  update.mutable_status()->set_uuid(update.uuid());
+
   // Update the status update state of the task and include the latest
   // state of the task in the status update.
   Framework* framework = getFramework(update.framework_id());
@@ -3041,9 +3064,6 @@ void Slave::forward(StatusUpdate update)
       }
 
       if (task != NULL) {
-        CHECK(update.has_uuid())
-          << "Expecting updates without 'uuid' to have been rejected";
-
         // We set the status update state of the task here because in
         // steady state master updates the status update state of the
         // task when it receives this update. If the master fails over,
@@ -3226,7 +3246,7 @@ Executor* Slave::getExecutor(
 
 
 ExecutorInfo Slave::getExecutorInfo(
-    const FrameworkID& frameworkId,
+    const FrameworkInfo& frameworkInfo,
     const TaskInfo& task)
 {
   CHECK_NE(task.has_executor(), task.has_command())
@@ -3238,14 +3258,39 @@ ExecutorInfo Slave::getExecutorInfo(
 
     // Command executors share the same id as the task.
     executor.mutable_executor_id()->set_value(task.task_id().value());
-    executor.mutable_framework_id()->CopyFrom(frameworkId);
+    executor.mutable_framework_id()->CopyFrom(frameworkInfo.id());
 
-    if (task.has_container() &&
-        task.container().type() != ContainerInfo::MESOS) {
+    if (task.has_container()) {
       // Store the container info in the executor info so it will
       // be checkpointed. This allows the correct containerizer to
       // recover this task on restart.
       executor.mutable_container()->CopyFrom(task.container());
+    }
+
+    bool hasRootfs = task.has_container() &&
+                     task.container().type() == ContainerInfo::MESOS &&
+                     task.container().mesos().has_image();
+
+    if (hasRootfs) {
+      ContainerInfo* container = executor.mutable_container();
+
+      // For command-tasks, we are now copying the entire `task.container` into
+      // the `executorInfo`. Thus, `executor.container` now has the image if
+      // `task.container` had one. However, in case of rootfs, we want to run
+      // the command executor in the host filesystem and prepare/mount the image
+      // into the container as a volume (command executor will use pivot_root to
+      // mount the image). For this reason, we need to strip the image in
+      // `executor.container.mesos`.
+      container->mutable_mesos()->clear_image();
+
+      container->set_type(ContainerInfo::MESOS);
+      Volume* volume = container->add_volumes();
+      volume->mutable_image()->CopyFrom(task.container().mesos().image());
+      volume->set_container_path(COMMAND_EXECUTOR_ROOTFS_CONTAINER_PATH);
+      volume->set_mode(Volume::RW);
+      // We need to set the executor user as root as it needs to
+      // perform chroot (even when switch_user is set to false).
+      executor.mutable_command()->set_user("root");
     }
 
     // Prepare an executor name which includes information on the
@@ -3301,7 +3346,11 @@ ExecutorInfo Slave::getExecutorInfo(
           task.command().container());
     }
 
-    if (task.command().has_user()) {
+    // We skip setting the user for the command executor that has
+    // a rootfs image since we need root permissions to chroot.
+    // We assume command executor will change to the correct user
+    // later on.
+    if (!hasRootfs && task.command().has_user()) {
       executor.mutable_command()->set_user(task.command().user());
     }
 
@@ -3314,6 +3363,31 @@ ExecutorInfo Slave::getExecutorInfo(
     executor.mutable_command()->set_shell(true);
 
     if (path.isSome()) {
+      if (hasRootfs) {
+        executor.mutable_command()->set_shell(false);
+        executor.mutable_command()->add_arguments("mesos-executor");
+        executor.mutable_command()->add_arguments(
+            "--sandbox_directory=" + flags.sandbox_directory);
+
+        // NOTE: if switch_user flag is false and the slave runs under
+        // a non-root user, the task will be rejected by the Posix
+        // filesystem isolator. Linux filesystem isolator requires slave
+        // to have root permission.
+        if (flags.switch_user) {
+          Option<string> user;
+          if (task.command().has_user()) {
+            user = task.command().user();
+          } else if (frameworkInfo.has_user()) {
+            user = frameworkInfo.user();
+          }
+
+          if (user.isSome()) {
+            executor.mutable_command()->add_arguments(
+                "--user=" + user.get());
+          }
+        }
+      }
+
       executor.mutable_command()->set_value(path.get());
     } else {
       executor.mutable_command()->set_value(
